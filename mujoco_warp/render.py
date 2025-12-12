@@ -17,11 +17,16 @@
 
 Usage: mjwarp-render <mjcf XML path> [flags]
 
-Example:
+Examples:
+  # Single frame rendering
   mjwarp-render benchmark/humanoid/humanoid.xml --nworld=1 --cam=0 --width=512 --height=512
+
+  # Benchmark rendering speed (FPS)
+  mjwarp-render benchmark/humanoid/humanoid.xml --benchmark --nworld=16 --benchmark_frames=100
 """
 
 import sys
+import time
 from typing import Sequence
 
 import mujoco
@@ -56,6 +61,48 @@ _ROLLOUT = flags.DEFINE_bool("rollout", False, "render a rollout video instead o
 _NSTEPS = flags.DEFINE_integer("nstep", 128, "number of simulation steps in the rollout")
 _ROLLOUT_OUTPUT = flags.DEFINE_string("output_video", "rollout.gif", "output path for rollout video")
 _RANDOM_ACTIONS = flags.DEFINE_bool("random_actions", False, "apply random actions during rollout")
+
+# Benchmark flags
+_BENCHMARK = flags.DEFINE_bool("benchmark", False, "run rendering speed benchmark")
+_BENCHMARK_FRAMES = flags.DEFINE_integer("benchmark_frames", 100, "number of frames to render for benchmark")
+_BENCHMARK_WARMUP = flags.DEFINE_integer("benchmark_warmup", 10, "number of warmup frames before timing")
+
+# Bowl escape environment flags
+_BOWL_ESCAPE = flags.DEFINE_bool("bowl_escape", False, "use bowl escape environment with heightfield")
+_BOWL_HSIZE = flags.DEFINE_integer("bowl_hsize", 2, "horizontal size of the bowl")
+_BOWL_VSIZE = flags.DEFINE_float("bowl_vsize", 2, "vertical size (depth) of the bowl")
+_BOWL_SIGMA = flags.DEFINE_float("bowl_sigma", 1.25, "standard deviation of the Gaussian bump")
+_BOWL_AMPLITUDE = flags.DEFINE_integer("bowl_amplitude", -10, "amplitude of the Gaussian bump")
+_BOWL_SEED = flags.DEFINE_integer("bowl_seed", 0, "random seed for bowl heightfield generation")
+
+
+def _create_bowl_escape_model() -> mujoco.MjModel:
+  """Create a bowl escape environment model with heightfield."""
+  try:
+    import jax
+    from vnl_playground.tasks.rodent.bowl_escape import BowlEscape, default_config
+  except ImportError as e:
+    raise ImportError(
+      "Bowl escape requires vnl-playground package. "
+      "Install it from: /home/talmolab/Desktop/SalkResearch/vnl-playground"
+    ) from e
+
+  config = default_config()
+  config.mujoco_impl = "warp"  # Required by base class compile()
+  config.bowl_hsize = _BOWL_HSIZE.value
+  config.bowl_vsize = _BOWL_VSIZE.value
+  config.bowl_sigma = _BOWL_SIGMA.value
+  config.bowl_amplitude = _BOWL_AMPLITUDE.value
+
+  rng = jax.random.PRNGKey(_BOWL_SEED.value)
+  print(f"Creating bowl escape environment...")
+  print(f"  hsize={config.bowl_hsize}, vsize={config.bowl_vsize}")
+  print(f"  sigma={config.bowl_sigma}, amplitude={config.bowl_amplitude}")
+  print(f"  seed={_BOWL_SEED.value}")
+
+  env = BowlEscape(rng=rng, config=config)
+  return env.mj_model
+
 
 def _load_model(path: epath.Path) -> mujoco.MjModel:
     if not path.exists():
@@ -200,13 +247,127 @@ def _sample_random_actions(m: mjw.Model, d: mjw.Data):
   d.ctrl.assign(random_ctrl)
 
 
-def _main(argv: Sequence[str]):
-  if len(argv) < 2:
-    raise app.UsageError("Missing required input: mjcf path.")
-  elif len(argv) > 2:
-    raise app.UsageError("Too many command-line arguments.")
+def _run_benchmark(
+    m: "mjw.Model",
+    d: "mjw.Data",
+    rc: "mjw.RenderContext",
+    num_frames: int,
+    warmup_frames: int,
+    nworld: int,
+) -> dict:
+  """Run rendering speed benchmark and return timing statistics.
 
-  mjm = _load_model(epath.Path(argv[1]))
+  Args:
+    m: MuJoCo Warp model.
+    d: MuJoCo Warp data.
+    rc: Render context.
+    num_frames: Number of render calls (frames) to time.
+    warmup_frames: Number of warmup frames before timing starts.
+    nworld: Number of parallel worlds being rendered.
+
+  Returns:
+    Dictionary with benchmark results including FPS and timing stats.
+  """
+  # Warmup phase - render frames without timing to warm up GPU/kernels
+  print(f"Running {warmup_frames} warmup frames...")
+  for _ in range(warmup_frames):
+    render_frame(m, d, rc)
+  wp.synchronize()
+
+  # Benchmark phase - time the rendering
+  print(f"Benchmarking {num_frames} frames ({num_frames * nworld} total images across {nworld} worlds)...")
+  frame_times = []
+
+  for i in range(num_frames):
+    start_time = time.perf_counter()
+    render_frame(m, d, rc)
+    wp.synchronize()  # Ensure GPU work is complete
+    end_time = time.perf_counter()
+    frame_times.append(end_time - start_time)
+
+  # Calculate statistics
+  frame_times = np.array(frame_times)
+  total_time = np.sum(frame_times)
+  avg_time = np.mean(frame_times)
+  min_time = np.min(frame_times)
+  max_time = np.max(frame_times)
+  std_time = np.std(frame_times)
+
+  # FPS for render calls (batched frames)
+  avg_fps = 1.0 / avg_time if avg_time > 0 else 0
+  min_fps = 1.0 / max_time if max_time > 0 else 0  # min FPS corresponds to max time
+  max_fps = 1.0 / min_time if min_time > 0 else 0  # max FPS corresponds to min time
+  throughput_fps = num_frames / total_time if total_time > 0 else 0
+
+  # Total images accounting for all worlds
+  total_images = num_frames * nworld
+  images_per_second = total_images / total_time if total_time > 0 else 0
+  avg_time_per_image = (avg_time * 1000) / nworld  # ms per individual image
+
+  return {
+    "num_frames": num_frames,
+    "warmup_frames": warmup_frames,
+    "nworld": nworld,
+    "total_images": total_images,
+    "total_time_s": total_time,
+    "avg_time_ms": avg_time * 1000,
+    "min_time_ms": min_time * 1000,
+    "max_time_ms": max_time * 1000,
+    "std_time_ms": std_time * 1000,
+    "avg_time_per_image_ms": avg_time_per_image,
+    "avg_fps": avg_fps,
+    "min_fps": min_fps,
+    "max_fps": max_fps,
+    "throughput_fps": throughput_fps,
+    "images_per_second": images_per_second,
+  }
+
+
+def _print_benchmark_results(results: dict, width: int, height: int):
+  """Print benchmark results in a formatted way."""
+  nworld = results["nworld"]
+  print("\n" + "=" * 60)
+  print("RENDERING BENCHMARK RESULTS")
+  print("=" * 60)
+  print(f"Configuration:")
+  print(f"  Resolution:       {width} x {height}")
+  print(f"  Parallel worlds:  {nworld}")
+  print(f"  Warmup frames:    {results['warmup_frames']}")
+  print(f"  Timed frames:     {results['num_frames']}")
+  print(f"  Total images:     {results['total_images']} ({results['num_frames']} frames x {nworld} worlds)")
+  print("-" * 60)
+  print(f"Timing (per render call / batch of {nworld} images):")
+  print(f"  Total time:       {results['total_time_s']:.3f} s")
+  print(f"  Avg per frame:    {results['avg_time_ms']:.3f} ms")
+  print(f"  Min per frame:    {results['min_time_ms']:.3f} ms")
+  print(f"  Max per frame:    {results['max_time_ms']:.3f} ms")
+  print(f"  Std deviation:    {results['std_time_ms']:.3f} ms")
+  print("-" * 60)
+  print(f"Performance (render calls / batched frames):")
+  print(f"  Throughput:       {results['throughput_fps']:.2f} FPS")
+  print(f"  Average:          {results['avg_fps']:.2f} FPS")
+  print(f"  Min:              {results['min_fps']:.2f} FPS")
+  print(f"  Max:              {results['max_fps']:.2f} FPS")
+  print("-" * 60)
+  print(f"Performance (individual images across all worlds):")
+  print(f"  Images/second:    {results['images_per_second']:.2f}")
+  print(f"  Avg time/image:   {results['avg_time_per_image_ms']:.3f} ms")
+  print("=" * 60)
+
+
+def _main(argv: Sequence[str]):
+  # Handle bowl escape mode vs regular MJCF loading
+  if _BOWL_ESCAPE.value:
+    if len(argv) > 1:
+      print("Warning: MJCF path ignored when --bowl_escape is enabled")
+    mjm = _create_bowl_escape_model()
+  else:
+    if len(argv) < 2:
+      raise app.UsageError("Missing required input: mjcf path (or use --bowl_escape).")
+    elif len(argv) > 2:
+      raise app.UsageError("Too many command-line arguments.")
+    mjm = _load_model(epath.Path(argv[1]))
+
   mjd = mujoco.MjData(mjm)
   mujoco.mj_forward(mjm, mjd)
 
@@ -224,11 +385,11 @@ def _main(argv: Sequence[str]):
     # Configure parallel worlds and per-camera resolution.
     if _TILED.value:
       # In tiled mode we always use 16 worlds and output a 4x4 grid at 512x512.
-      nworld = 16
-      grid_rows = 4
-      grid_cols = 4
-      final_width = 512
-      final_height = 512
+      nworld = 64
+      grid_rows = 8
+      grid_cols = 8
+      final_width = 512 * 4
+      final_height = 512 * 4
       render_width = final_width // grid_cols
       render_height = final_height // grid_rows
     else:
@@ -237,7 +398,7 @@ def _main(argv: Sequence[str]):
       render_width = int(_WIDTH.value)
       render_height = int(_HEIGHT.value)
 
-    d = mjw.put_data(mjm, mjd, nworld=nworld)
+    d = mjw.put_data(mjm, mjd, nworld=nworld, njmax=700, nconmax=50)
 
     rc = mjw.create_render_context(
       mjm,
@@ -267,6 +428,17 @@ def _main(argv: Sequence[str]):
 
     rgb_adr = rc.rgb_adr.numpy()
     depth_adr = rc.depth_adr.numpy()
+
+    if _BENCHMARK.value:
+      # Benchmark mode - measure rendering performance
+      results = _run_benchmark(
+        m, d, rc,
+        num_frames=_BENCHMARK_FRAMES.value,
+        warmup_frames=_BENCHMARK_WARMUP.value,
+        nworld=nworld,
+      )
+      _print_benchmark_results(results, render_width, render_height)
+      return
 
     if _ROLLOUT.value:
       if not _RENDER_RGB.value:
