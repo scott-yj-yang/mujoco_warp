@@ -34,6 +34,7 @@ from PIL import Image
 
 import mujoco_warp as mjw
 from mujoco_warp._src.io import override_model
+from mujoco_warp._src.render import render as render_frame
 
 _NWORLD = flags.DEFINE_integer("nworld", 1, "number of parallel worlds")
 _WORLD = flags.DEFINE_integer("world", 0, "world index to save from")
@@ -54,6 +55,7 @@ _TILED = flags.DEFINE_bool("tiled", False, "render a 4x4 tiled grid across 16 wo
 _ROLLOUT = flags.DEFINE_bool("rollout", False, "render a rollout video instead of a single frame")
 _NSTEPS = flags.DEFINE_integer("nstep", 128, "number of simulation steps in the rollout")
 _ROLLOUT_OUTPUT = flags.DEFINE_string("output_video", "rollout.gif", "output path for rollout video")
+_RANDOM_ACTIONS = flags.DEFINE_bool("random_actions", False, "apply random actions during rollout")
 
 def _load_model(path: epath.Path) -> mujoco.MjModel:
     if not path.exists():
@@ -161,6 +163,43 @@ def _save_tiled_depth(
   Image.fromarray(full).save(out_path)
 
 
+def _sample_random_actions(m: mjw.Model, d: mjw.Data):
+  """Sample random actions for all worlds and actuators."""
+  nworld = d.nworld
+  nu = m.nu
+
+  if nu == 0:
+    return
+
+  # Get control ranges and limits
+  ctrlrange = m.actuator_ctrlrange.numpy()  # shape: (*, nu, 2) or (nu, 2)
+  ctrllimited = m.actuator_ctrllimited.numpy()  # shape: (nu,)
+
+  # Handle heterogeneous vs homogeneous ctrlrange
+  if ctrlrange.ndim == 3:
+    # Heterogeneous: (nworld, nu, 2) - use world 0 as reference
+    ctrl_lo = ctrlrange[0, :, 0]
+    ctrl_hi = ctrlrange[0, :, 1]
+  else:
+    # Homogeneous: (nu, 2)
+    ctrl_lo = ctrlrange[:, 0]
+    ctrl_hi = ctrlrange[:, 1]
+
+  # Sample random actions
+  random_ctrl = np.random.uniform(size=(nworld, nu)).astype(np.float32)
+
+  # Apply control ranges where limited
+  for i in range(nu):
+    if ctrllimited[i]:
+      random_ctrl[:, i] = ctrl_lo[i] + random_ctrl[:, i] * (ctrl_hi[i] - ctrl_lo[i])
+    else:
+      # For unlimited actuators, use a reasonable default range [-1, 1]
+      random_ctrl[:, i] = random_ctrl[:, i] * 2.0 - 1.0
+
+  # Copy to device
+  d.ctrl.assign(random_ctrl)
+
+
 def _main(argv: Sequence[str]):
   if len(argv) < 2:
     raise app.UsageError("Missing required input: mjcf path.")
@@ -245,12 +284,13 @@ def _main(argv: Sequence[str]):
       frame_duration_ms = max(1, int(round(1000.0 / target_fps)))
 
       total_steps = int(_NSTEPS.value)
-      print(f"Rendering rollout for {total_steps} steps (dt={dt:.4f}, steps_per_frame={steps_per_frame})...")
+      action_info = " with random actions" if _RANDOM_ACTIONS.value else ""
+      print(f"Rendering rollout for {total_steps} steps{action_info} (dt={dt:.4f}, steps_per_frame={steps_per_frame})...")
       frames = []
 
       step = 0
       while step < total_steps:
-        mjw.render(m, d, rc)
+        render_frame(m, d, rc)
 
         if _TILED.value:
           rgb_all = rc.rgb_data.numpy()
@@ -290,6 +330,8 @@ def _main(argv: Sequence[str]):
         for _ in range(steps_per_frame):
           if step >= total_steps:
             break
+          if _RANDOM_ACTIONS.value:
+            _sample_random_actions(m, d)
           mjw.step(m, d)
           step += 1
 
@@ -308,7 +350,7 @@ def _main(argv: Sequence[str]):
 
     # Single-frame rendering path.
     print("Rendering single frame...")
-    mjw.render(m, d, rc)
+    render_frame(m, d, rc)
 
     if _TILED.value:
       # Use all worlds and tile them into a 4x4 grid.

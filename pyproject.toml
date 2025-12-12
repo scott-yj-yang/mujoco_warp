@@ -68,6 +68,7 @@ cuda = [
 [project.scripts]
 mjwarp-testspeed = "mujoco_warp.testspeed:main"
 mjwarp-viewer = "mujoco_warp.viewer:main"
+mjwarp-render = "mujoco_warp.render:main"
 
 [project.urls]
 Homepage = "https://github.com/google-deepmind/mujoco_warp"
