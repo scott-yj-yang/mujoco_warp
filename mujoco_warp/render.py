@@ -26,6 +26,7 @@ Examples:
 """
 
 import sys
+import os
 import time
 from typing import Sequence
 
@@ -79,6 +80,7 @@ _BOWL_SEED = flags.DEFINE_integer("bowl_seed", 0, "random seed for bowl heightfi
 def _create_bowl_escape_model() -> mujoco.MjModel:
   """Create a bowl escape environment model with heightfield."""
   try:
+    os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
     import jax
     from vnl_playground.tasks.rodent.bowl_escape import BowlEscape, default_config
   except ImportError as e:
